@@ -105,3 +105,68 @@ class StreamingRelPositionalEncoding(torch.nn.Module):
         x = x * self.xscale
         pos_emb = self.position_encoding(offset, x.size(1), False, right_context_size).to(device=x.device, dtype=x.dtype)
         return self.dropout(x), self.dropout(pos_emb)
+
+class StreamingRotaryPositionalEncoding(torch.nn.Module):
+    """
+    Streaming rotary positional encoding (RoFormer style) for chunked/streaming inputs.
+
+    Precomputes sin and cos caches up to max_seq_len, and applies rotation
+    based on a position offset (accumulated frames) for each chunk.
+
+    Args:
+        d_model: Embedding dimension (must be even).
+        dropout_rate: Dropout on the output.
+        max_seq_len: Maximum sequence length to precompute.
+    """
+    def __init__(self, d_model: int, dropout_rate: float = 0.0, max_seq_len: int = 50000) -> None:
+        super().__init__()
+        assert d_model % 2 == 0, "d_model must be even for rotary embeddings"
+        self.d_model = d_model
+        self.dropout = torch.nn.Dropout(dropout_rate)
+        self.max_seq_len = max_seq_len
+
+        # Compute inverse frequencies and precompute sin/cos caches
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, d_model, 2).float() / d_model))  # (d_model/2,)
+        pos_seq = torch.arange(0, max_seq_len, dtype=torch.float32)  # (max_seq_len,)
+        # Outer to get frequencies for each position
+        freqs = torch.einsum('i,j->ij', pos_seq, inv_freq)  # (max_seq_len, d_model/2)
+        # Build sin and cos caches
+        sin_cache = freqs.sin()  # (max_seq_len, d_model/2)
+        cos_cache = freqs.cos()
+        # Register as buffers so they move with the module
+        self.register_buffer('sin_cache', sin_cache, persistent=False)
+        self.register_buffer('cos_cache', cos_cache, persistent=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        offset: int = 0
+    ) -> torch.Tensor:
+        """
+        Apply rotary positional encoding to a chunk.
+
+        Args:
+            x: Tensor of shape (batch, seq_len, d_model).
+            offset: Starting position index for this chunk (int).
+
+        Returns:
+            Tensor of same shape with rotary pos-emb applied.
+        """
+        bsz, seq_len, dim = x.size()
+        device = x.device
+        # Slice sin/cos for this chunk
+        sin = self.sin_cache[offset: offset + seq_len].to(device)  # (seq_len, d_model/2)
+        cos = self.cos_cache[offset: offset + seq_len].to(device)
+
+        # Expand to (batch, seq_len, d_model/2)
+        sin = sin.unsqueeze(0).expand(bsz, -1, -1)
+        cos = cos.unsqueeze(0).expand(bsz, -1, -1)
+
+        # Apply rotation: split last dim
+        x1, x2 = x[..., :dim//2], x[..., dim//2:]
+        x_rotated = torch.cat([
+            x1 * cos - x2 * sin,
+            x1 * sin + x2 * cos
+        ], dim=-1)
+
+        return self.dropout(x_rotated)
